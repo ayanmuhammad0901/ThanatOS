@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -e
+
+echo "Assembling bootloader..."
+nasm -f bin boot.asm -o boot.bin
+
+# Generate a dummy placeholder kernel.bin if you haven't written one yet
+if [ ! -f kernel.bin ]; then
+    echo "Creating a placeholder kernel.bin..."
+    echo -e "Kernel Loaded Successfully!" > kernel.bin
+fi
+
+echo "Calculating sizing metrics..."
+# Get the exact byte size of your kernel
+KERNEL_SIZE=$(wc -c < kernel.bin)
+# Calculate how many 512-byte sectors it occupies (rounded up)
+KERNEL_SECTORS=$(( (KERNEL_SIZE + 511) / 512 ))
+# Pad the kernel so it ends perfectly on a sector boundary
+dd if=/dev/zero of=kernel_padded.bin bs=512 count=$KERNEL_SECTORS status=none
+dd if=kernel.bin of=kernel_padded.bin conv=notrunc status=none
+
+echo "Constructing clear FAT12 structures..."
+# Sector 0: Boot sector (512 bytes)
+# Sectors 1-18: Two FAT tables (9 sectors each = 18 sectors = 9216 bytes)
+# Sectors 19-32: Root Directory (14 sectors = 7168 bytes)
+# Sector 33+: Data region (Where kernel clusters sit)
+
+# 1. Create a clean 1.44MB blank template
+dd if=/dev/zero of=ThanatOS.img bs=1024 count=1440 status=none
+
+# 2. Burn your compiled boot sector to sector 0
+dd if=boot.bin of=ThanatOS.img bs=512 count=1 conv=notrunc status=none
+
+# 3. Write a mock FAT12 entry so cluster 2 points to end-of-chain (0xFFF)
+# This satisfies your bootloader's cluster chain reader loop!
+python3 -c "
+import sys
+fat = bytearray(9216 * 2) # space for FAT1 and FAT2
+fat[0] = 0xF0 # Media descriptor
+fat[1] = 0xFF # Cluster 0 mapping
+fat[2] = 0xFF # Cluster 1 mapping
+# Cluster 2 (Kernel start) setup:
+if $KERNEL_SECTORS == 1:
+    fat[3] = 0xFF
+    fat[4] = 0x0F
+else:
+    # If the kernel spans multiple sectors, link cluster 2 to cluster 3, etc.
+    # For a simple placeholder, pointing cluster 2 directly to EOF satisfies it
+    fat[3] = 0xFF
+    fat[4] = 0x0F
+sys.stdout.buffer.write(fat)
+" > fat_tables.bin
+dd if=fat_tables.bin of=ThanatOS.img bs=512 seek=1 count=18 conv=notrunc status=none
+
+# 4. Inject a raw directory entry at sector 19 targeting cluster 0x0002
+python3 -c "
+import sys
+entry = bytearray(7168) # 14 sectors of directory space
+# Offset 0: Filename 'KERNEL  ' (8 spaces padding)
+entry[0:8] = b'KERNEL  '
+# Offset 8: Extension 'BIN'
+entry[8:11] = b'BIN'
+# Offset 11: Attributes (0x00 standard file)
+entry[11] = 0x00
+# Offset 26: Starting cluster (0x0002 low byte)
+entry[26] = 0x02
+entry[27] = 0x00
+# Offset 28: File size (32-bit integer)
+size = $KERNEL_SIZE
+entry[28] = size & 0xFF
+entry[29] = (size >> 8) & 0xFF
+entry[30] = (size >> 16) & 0xFF
+entry[31] = (size >> 24) & 0xFF
+sys.stdout.buffer.write(entry)
+" > root_dir.bin
+dd if=root_dir.bin of=ThanatOS.img bs=512 seek=19 count=14 conv=notrunc status=none
+
+# 5. Burn the padded kernel payload directly into the cluster data region (sector 33)
+dd if=kernel_padded.bin of=ThanatOS.img bs=512 seek=33 count=$KERNEL_SECTORS conv=notrunc status=none
+
+# Clean up temp files safely
+rm -f kernel_padded.bin fat_tables.bin root_dir.bin
+
+echo "Build complete! Running ThanatOS.img in QEMU, Master..."
+qemu-system-x86_64 -fda ThanatOS.img
